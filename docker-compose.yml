@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  # Signaling Server (Node.js + Express)
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: aicams-server
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 3000
+      HOST: 0.0.0.0
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN}
+      DB_PATH: /app/data/aicams.db
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      STUN_SERVERS: ${STUN_SERVERS}
+    volumes:
+      - ./server/src:/app/src
+      - ./server/data:/app/data
+      - ./server/logs:/app/logs
+    depends_on:
+      - db
+    networks:
+      - aicams-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Database (SQLite)
+  # Note: SQLite runs in-process in server for MVP.
+  # For scaling, upgrade to PostgreSQL with this service:
+  # db:
+  #   image: postgres:15-alpine
+  #   container_name: aicams-db
+  #   environment:
+  #     POSTGRES_DB: aicams
+  #     POSTGRES_USER: ${DB_USER}
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD}
+  #   volumes:
+  #     - db-data:/var/lib/postgresql/data
+  #   networks:
+  #     - aicams-network
+
+  # Web Viewer (React + Vite)
+  viewer:
+    build:
+      context: ./viewer
+      dockerfile: Dockerfile
+    container_name: aicams-viewer
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
+      VITE_SIGNALING_URL: ${VITE_SIGNALING_URL:-ws://localhost:3000}
+    volumes:
+      - ./viewer/src:/app/src
+      - ./viewer/public:/app/public
+    depends_on:
+      - server
+    networks:
+      - aicams-network
+    restart: unless-stopped
+
+  # Camera Component (Python)
+  # Note: Requires access to camera hardware.
+  # Run on device with camera, not in Docker by default.
+  # Uncomment to run in Docker if camera is accessible.
+  # camera:
+  #   build:
+  #     context: ./camera
+  #     dockerfile: Dockerfile
+  #   container_name: aicams-camera
+  #   environment:
+  #     DEVICE_NAME: ${DEVICE_NAME}
+  #     DEVICE_ID: ${DEVICE_ID}
+  #     SERVER_URL: ${SERVER_URL:-http://server:3000}
+  #     API_KEY: ${CAMERA_API_KEY}
+  #   volumes:
+  #     - ./camera/data:/app/data
+  #     - ./camera/logs:/app/logs
+  #   devices:
+  #     - /dev/video0:/dev/video0  # Webcam access
+  #   networks:
+  #     - aicams-network
+  #   depends_on:
+  #     - server
+  #   restart: unless-stopped
+
+networks:
+  aicams-network:
+    driver: bridge
+
+volumes:
+  # Uncomment when using PostgreSQL
+  # db-data:
+  #   driver: local

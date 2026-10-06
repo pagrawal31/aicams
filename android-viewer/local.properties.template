@@ -1,0 +1,7 @@
+# Android SDK location
+# Change this to your Android SDK path
+# On Mac: /Users/[username]/Library/Android/sdk
+# On Linux: ~/Android/Sdk
+# On Windows: C:\\Users\\[username]\\AppData\\Local\\Android\\Sdk
+
+sdk.dir=/Users/Anvi/Library/Android/sdk

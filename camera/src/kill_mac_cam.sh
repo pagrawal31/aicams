@@ -1,0 +1,2 @@
+
+pkill -f 'python.*src/main.py|python.*main.py' || pgrep -af 'python.*src/main.py|python.*main.py' || true
