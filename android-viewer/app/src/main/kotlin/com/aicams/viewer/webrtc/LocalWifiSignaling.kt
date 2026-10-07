@@ -249,7 +249,13 @@ internal class LocalWifiSignalingClient(
                 scheduleFlush()
                 readMessages(target)
             } catch (error: Exception) {
-                if (running.get()) onState("local signaling error: ${error.message ?: "connection failed"}")
+                if (running.get()) {
+                    Log.w(TAG, "Could not connect to the discovered local camera", error)
+                    onState(
+                        "local signaling error: could not reach the camera. " +
+                            "Check that both phones are on the same Wi-Fi and try again."
+                    )
+                }
             } finally {
                 try { socket?.close() } catch (_: Exception) { }
                 socket = null

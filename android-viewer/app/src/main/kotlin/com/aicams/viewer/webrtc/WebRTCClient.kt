@@ -41,30 +41,14 @@ class WebRTCClient(
     private var previousAudioMode = AudioManager.MODE_NORMAL
     private var previousSpeakerphoneState = false
     private var audioRouteConfigured = false
-    private val eglBase = EglBase.create()
+    private val eglContext = WebRtcRuntime.eglContext(context)
     private val remoteRenderer = SurfaceViewRenderer(context).apply {
-        init(eglBase.eglBaseContext, null)
+        init(eglContext, null)
         setEnableHardwareScaler(true)
         setMirror(false)
     }
 
-    private lateinit var peerConnectionFactory: PeerConnectionFactory
-
-    init {
-        Log.d(TAG, "Initializing WebRTC native library")
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
-                .setEnableInternalTracer(true)
-                .createInitializationOptions()
-        )
-
-        peerConnectionFactory = PeerConnectionFactory.builder()
-            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
-            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
-            .setAudioEncoderFactoryFactory(BuiltinAudioEncoderFactoryFactory())
-            .setAudioDecoderFactoryFactory(BuiltinAudioDecoderFactoryFactory())
-            .createPeerConnectionFactory()
-    }
+    private val peerConnectionFactory = WebRtcRuntime.factory(context)
 
     private var peerConnection: PeerConnection? = null
     private var started = false
@@ -75,12 +59,15 @@ class WebRTCClient(
     private val localSessionId = java.util.UUID.randomUUID().toString()
     private var remoteMotionState: Boolean? = null
     @Volatile private var remoteAudioTrack: AudioTrack? = null
+    @Volatile private var remoteVideoTrack: VideoTrack? = null
     @Volatile private var remoteAudioEnabled = true
     @Volatile private var snapshotsDataChannel: DataChannel? = null
     private val snapshotRequestSent = AtomicBoolean(false)
     private val incomingSnapshots = ConcurrentHashMap<String, SnapshotAssembly>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val offerSent = AtomicBoolean(false)
+    private val mediaConnected = AtomicBoolean(false)
+    private val stopped = AtomicBoolean(false)
 
     private data class SnapshotAssembly(
         val timestampMs: Long,
@@ -90,8 +77,9 @@ class WebRTCClient(
 
     fun getRemoteRenderer(): SurfaceViewRenderer = remoteRenderer
 
+    @Synchronized
     fun start(connectionMode: StreamConnectionMode = StreamConnectionMode.RELAY_VIA_LAPTOP) {
-        if (started) {
+        if (started || stopped.get()) {
             Log.d(TAG, "WebRTC start called but already started; ignoring duplicate call")
             return
         }
@@ -104,10 +92,19 @@ class WebRTCClient(
         Log.d(TAG, "Starting WebRTC connection to camera baseUrl=$cameraBaseUrl")
         configureSpeakerphoneOutput()
 
-        val onSignalingState: (String) -> Unit = { signalingState ->
+        val onSignalingState: (String) -> Unit = signalingCallback@ { signalingState ->
+            if (stopped.get()) return@signalingCallback
             Log.i(TAG, signalingState)
-            if (signalingState.contains("error", ignoreCase = true) || signalingState.contains("failed", ignoreCase = true)) {
-                onError(IllegalStateException(signalingState))
+            val isFailure = signalingState.contains("error", ignoreCase = true) ||
+                signalingState.contains("failed", ignoreCase = true)
+            if (isFailure) {
+                if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && mediaConnected.get()) {
+                    // P2P signaling is only needed to establish WebRTC. A late socket/WebSocket
+                    // failure must not replace a healthy direct media connection with an error.
+                    Log.w(TAG, "Ignoring signaling failure after direct media connected: $signalingState")
+                } else {
+                    reportError(IllegalStateException(signalingState))
+                }
             }
         }
         signalingTransport = when (connectionMode) {
@@ -133,6 +130,7 @@ class WebRTCClient(
         }
 
         CoroutineScope(Dispatchers.IO).launch {
+            if (stopped.get()) return@launch
             try {
                 val iceServers = listOf(
                     PeerConnection.IceServer("stun:stun.l.google.com:19302"),
@@ -141,31 +139,55 @@ class WebRTCClient(
 
                 Log.d(TAG, "Using ICE servers: ${iceServers.map { it.uri }.joinToString()}")
 
-                val config = PeerConnection.RTCConfiguration(iceServers)
+                val config = PeerConnection.RTCConfiguration(iceServers).apply {
+                    // Android can report ICE gathering COMPLETE before NetworkMonitor has
+                    // delivered the current Wi-Fi interface. Keep gathering so the interface
+                    // arriving a few milliseconds later produces usable host candidates.
+                    continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+                }
                 val pc = peerConnectionFactory.createPeerConnection(config, object : PeerConnection.Observer {
                     override fun onConnectionChange(newState: PeerConnection.PeerConnectionState?) {
+                        if (stopped.get()) return
                         Log.d(TAG, "Peer connection state changed: ${newState?.name ?: "unknown"}")
+                        when (newState) {
+                            PeerConnection.PeerConnectionState.CONNECTED -> mediaConnected.set(true)
+                            PeerConnection.PeerConnectionState.CLOSED,
+                            PeerConnection.PeerConnectionState.DISCONNECTED,
+                            PeerConnection.PeerConnectionState.FAILED -> mediaConnected.set(false)
+                            else -> Unit
+                        }
                         onConnectionStateChanged(newState?.name ?: "unknown")
                     }
 
                     override fun onIceCandidate(candidate: IceCandidate?) {
                         // The complete gathered SDP is sent as one offer; no trickle endpoint is needed.
+                        candidate?.let {
+                            Log.i(TAG, "Gathered ICE candidate for ${it.sdpMid}: ${it.sdp.take(120)}")
+                            mainHandler.postDelayed({
+                                if (!stopped.get()) peerConnection?.let(::sendOfferIfIceReady)
+                            }, ICE_CANDIDATE_SETTLE_MS)
+                        }
                     }
 
                     override fun onAddStream(stream: MediaStream?) {
+                        if (stopped.get()) return
                         Log.d(TAG, "onAddStream called")
                         val videoTrack = stream?.videoTracks?.firstOrNull() ?: return
-                        videoTrack.addSink(remoteRenderer)
-                        onStreamReady(remoteRenderer)
+                        attachRemoteVideoTrack(videoTrack)
                     }
 
                     override fun onRemoveStream(stream: MediaStream?) = Unit
                     override fun onDataChannel(channel: DataChannel?) = Unit
                     override fun onRenegotiationNeeded() = Unit
                     override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
-                    override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) = Unit
-                    override fun onStandardizedIceConnectionChange(newState: PeerConnection.IceConnectionState?) = Unit
+                    override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
+                        Log.i(TAG, "ICE connection state changed: ${newState?.name ?: "unknown"}")
+                    }
+                    override fun onStandardizedIceConnectionChange(newState: PeerConnection.IceConnectionState?) {
+                        Log.i(TAG, "Standardized ICE state changed: ${newState?.name ?: "unknown"}")
+                    }
                     override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState?) {
+                        Log.i(TAG, "ICE gathering state changed: ${newState?.name ?: "unknown"}")
                         if (newState == PeerConnection.IceGatheringState.COMPLETE) {
                             peerConnection?.let(::sendOfferIfIceReady)
                         }
@@ -173,30 +195,37 @@ class WebRTCClient(
                     override fun onSignalingChange(newState: PeerConnection.SignalingState?) = Unit
                     override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) = Unit
                     override fun onAddTrack(receiver: RtpReceiver?, mediaStreams: Array<out MediaStream>?) {
+                        if (stopped.get()) return
                         Log.d(TAG, "onAddTrack called with ${mediaStreams?.size ?: 0} media streams")
                         when (val track = receiver?.track()) {
-                            is VideoTrack -> track.addSink(remoteRenderer)
+                            is VideoTrack -> attachRemoteVideoTrack(track)
                             is AudioTrack -> {
                                 remoteAudioTrack = track
                                 track.setEnabled(remoteAudioEnabled)
                                 Log.i(TAG, "Remote audio track enabled for playback")
                             }
                         }
-                        onStreamReady(remoteRenderer)
                     }
                     override fun onTrack(transceiver: RtpTransceiver?) {
+                        if (stopped.get()) return
                         when (val track = transceiver?.receiver?.track()) {
                             is AudioTrack -> {
                                 remoteAudioTrack = track
                                 track.setEnabled(remoteAudioEnabled)
                                 Log.i(TAG, "Remote audio track enabled for playback")
                             }
-                            is VideoTrack -> track.addSink(remoteRenderer)
+                            is VideoTrack -> attachRemoteVideoTrack(track)
                         }
                     }
                 })
 
-                peerConnection = pc
+                synchronized(this@WebRTCClient) {
+                    if (stopped.get()) {
+                        pc?.dispose()
+                        return@launch
+                    }
+                    peerConnection = pc
+                }
                 if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP) {
                     val snapshotChannel = pc?.createDataChannel("motion-snapshots", DataChannel.Init())
                         ?: throw IllegalStateException("Could not create motion snapshot data channel")
@@ -229,7 +258,7 @@ class WebRTCClient(
 
                             override fun onSetFailure(error: String?) {
                                 Log.e(TAG, "Failed to set local description: ${error ?: "unknown error"}")
-                                onError(RuntimeException(error ?: "Failed to set local description"))
+                                reportError(RuntimeException(error ?: "Failed to set local description"))
                             }
 
                             override fun onCreateSuccess(desc: SessionDescription?) = Unit
@@ -240,29 +269,34 @@ class WebRTCClient(
                     override fun onSetSuccess() = Unit
                     override fun onSetFailure(error: String?) {
                         Log.e(TAG, "Offer creation failed: ${error ?: "unknown error"}")
-                        onError(RuntimeException(error ?: "Failed to create offer"))
+                        reportError(RuntimeException(error ?: "Failed to create offer"))
                     }
 
                     override fun onCreateFailure(error: String?) {
                         Log.e(TAG, "Offer creation failure: ${error ?: "unknown error"}")
-                        onError(RuntimeException(error ?: "Failed to create offer"))
+                        reportError(RuntimeException(error ?: "Failed to create offer"))
                     }
                 }, mediaConstraints)
             } catch (t: Throwable) {
                 Log.e(TAG, "Unexpected WebRTC setup exception", t)
-                onError(t)
+                reportError(t)
             }
         }
     }
 
     private fun sendOfferIfIceReady(pc: PeerConnection) {
-        if (!localDescriptionSet || pc.iceGatheringState() != PeerConnection.IceGatheringState.COMPLETE) return
-        if (!offerSent.compareAndSet(false, true)) return
+        if (!localDescriptionSet) return
         val gatheredOffer = pc.localDescription
         if (gatheredOffer == null) {
-            onError(IllegalStateException("Local WebRTC offer is missing"))
+            reportError(IllegalStateException("Local WebRTC offer is missing"))
             return
         }
+        if (!gatheredOffer.description.contains("a=candidate:")) {
+            Log.w(TAG, "ICE gathering completed before a network candidate was available; waiting for Wi-Fi")
+            return
+        }
+        if (!offerSent.compareAndSet(false, true)) return
+        logSdpTransport("Local offer", gatheredOffer.description)
         sendOffer(gatheredOffer)
     }
 
@@ -281,6 +315,20 @@ class WebRTCClient(
             audioRouteConfigured = true
         }
         Log.i(TAG, "Configured WebRTC playback for phone speaker")
+    }
+
+    @Synchronized
+    private fun attachRemoteVideoTrack(track: VideoTrack) {
+        if (stopped.get()) return
+        if (remoteVideoTrack?.id() != track.id()) {
+            remoteVideoTrack?.removeSink(remoteRenderer)
+            remoteVideoTrack = track
+            track.setEnabled(true)
+            track.addSink(remoteRenderer)
+            Log.i(TAG, "Remote video track attached to renderer: id=${track.id()}")
+        }
+        mediaConnected.set(true)
+        onStreamReady(remoteRenderer)
     }
 
     /** Mutes or unmutes only this viewer's received audio; it does not change the camera's mic. */
@@ -311,7 +359,7 @@ class WebRTCClient(
                 payload.put("sessionId", localSessionId)
             }
             val sent = signalingTransport?.send(payload) ?: false
-            if (!sent) onError(IllegalStateException("Could not send P2P offer to signaling server"))
+            if (!sent) reportError(IllegalStateException("Could not send P2P offer to signaling server"))
             return
         }
         CoroutineScope(Dispatchers.IO).launch {
@@ -350,7 +398,7 @@ class WebRTCClient(
                         }
                         override fun onSetFailure(error: String?) {
                             Log.e(TAG, "Failed to set remote description: ${error ?: "unknown error"}")
-                            onError(RuntimeException(error ?: "Failed to set remote description"))
+                            reportError(RuntimeException(error ?: "Failed to set remote description"))
                         }
 
                         override fun onCreateSuccess(desc: SessionDescription?) = Unit
@@ -359,7 +407,7 @@ class WebRTCClient(
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "Error while sending offer", t)
-                onError(t)
+                reportError(t)
             }
         }
     }
@@ -430,6 +478,7 @@ class WebRTCClient(
     }
 
     private fun handleP2PSignalingMessage(message: JSONObject) {
+        if (stopped.get()) return
         when (message.optString("type")) {
             "motion" -> {
                 if (message.optString("deviceId") != Constants.P2P_DEVICE_ID) return
@@ -444,24 +493,48 @@ class WebRTCClient(
             "answer" -> {
                 val connection = peerConnection ?: return
                 val answer = SessionDescription(SessionDescription.Type.ANSWER, message.optString("sdp"))
+                logSdpTransport("Remote answer", answer.description)
                 connection.setRemoteDescription(object : SdpObserver {
                     override fun onSetSuccess() {
                         Log.i(TAG, "P2P answer applied; direct media connection is negotiating")
                     }
                     override fun onSetFailure(error: String?) {
-                        onError(IllegalStateException(error ?: "Could not apply P2P answer"))
+                        reportError(IllegalStateException(error ?: "Could not apply P2P answer"))
                     }
                     override fun onCreateSuccess(description: SessionDescription?) = Unit
                     override fun onCreateFailure(error: String?) = Unit
                 }, answer)
             }
-            "error" -> onError(IllegalStateException(message.optString("message", "P2P signaling failed")))
+            "error" -> reportError(IllegalStateException(message.optString("message", "P2P signaling failed")))
             "peer_disconnected" -> onConnectionStateChanged("DISCONNECTED")
         }
     }
 
+    private fun reportError(error: Throwable) {
+        if (stopped.get()) return
+        if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && mediaConnected.get()) {
+            Log.w(TAG, "Ignoring control-path error after direct media connected", error)
+            return
+        }
+        onError(error)
+    }
+
+    private fun logSdpTransport(label: String, sdp: String) {
+        val lines = sdp.lineSequence()
+            .filter { line ->
+                line.startsWith("m=") || line.startsWith("a=mid:") ||
+                    line.startsWith("a=send") || line.startsWith("a=recv") ||
+                    line.startsWith("a=inactive") || line.startsWith("a=candidate:")
+            }
+            .toList()
+        Log.i(TAG, "$label transport (${lines.size} lines): ${lines.joinToString(" | ")}")
+    }
+
+    @Synchronized
     fun stop() {
+        if (!stopped.compareAndSet(false, true)) return
         Log.d(TAG, "Stopping WebRTC client")
+        mediaConnected.set(false)
         diagnostics.stop()
         try {
             (p2pSessionId ?: if (connectionMode == StreamConnectionMode.P2P_LOCAL_WIFI) localSessionId else null)?.let { sessionId ->
@@ -473,16 +546,21 @@ class WebRTCClient(
             snapshotsDataChannel?.dispose()
             snapshotsDataChannel = null
             incomingSnapshots.clear()
-            peerConnection?.close()
+            remoteVideoTrack?.removeSink(remoteRenderer)
+            remoteVideoTrack = null
+            remoteAudioTrack = null
+            val connection = peerConnection
+            peerConnection = null
+            connection?.close()
+            connection?.dispose()
         } catch (_: Throwable) {
         }
         restoreAudioOutput()
-        peerConnection = null
         remoteRenderer.release()
-        eglBase.release()
     }
 
     companion object {
+        private const val ICE_CANDIDATE_SETTLE_MS = 300L
         fun buildOfferUrl(baseUrl: String): String = "${baseUrl.trimEnd('/')}/offer"
         fun buildIceCandidateUrl(baseUrl: String): String = "${baseUrl.trimEnd('/')}/ice-candidate"
 

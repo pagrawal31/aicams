@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
@@ -78,7 +79,11 @@ fun CameraScreen(
     navController: NavHostController,
     cameraName: String = "Living Room",
     cameraLocation: String = "Main Floor",
-    cameraBaseUrl: String = Constants.API_BASE_URL
+    cameraBaseUrl: String = Constants.API_BASE_URL,
+    isInPipMode: Boolean = false,
+    onConfigurePip: (Any, Boolean) -> Unit = { _, _ -> },
+    onClearPip: (Any) -> Unit = {},
+    onEnterPip: (Any) -> Boolean = { false }
 ) {
     var connectionState by remember { mutableStateOf("connecting") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -92,6 +97,25 @@ fun CameraScreen(
     val activity = context as? Activity
     val motionTone = remember(context) { ToneGenerator(AudioManager.STREAM_ALARM, 60) }
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val pipOwner = remember { Any() }
+
+    DisposableEffect(view) {
+        val wasKeepingScreenOn = view.keepScreenOn
+        view.keepScreenOn = true
+        onDispose { view.keepScreenOn = wasKeepingScreenOn }
+    }
+
+    LaunchedEffect(connectionState) {
+        onConfigurePip(pipOwner, connectionState == "connected")
+    }
+
+    DisposableEffect(pipOwner) {
+        onDispose { onClearPip(pipOwner) }
+    }
+
+    LaunchedEffect(isInPipMode) {
+        if (isInPipMode) isFullscreen = false
+    }
 
     DisposableEffect(motionTone) {
         onDispose { motionTone.release() }
@@ -126,6 +150,7 @@ fun CameraScreen(
             cameraBaseUrl = cameraBaseUrl,
             onConnectionStateChanged = { state ->
                 Log.d(TAG, "Connection state changed: $state")
+                if (state == "CONNECTED") errorMessage = null
                 connectionState = when (state) {
                     "CONNECTED" -> "connected"
                     "FAILED", "DISCONNECTED" -> "failed"
@@ -134,6 +159,7 @@ fun CameraScreen(
             },
             onStreamReady = {
                 Log.d(TAG, "Remote stream ready; attaching renderer")
+                errorMessage = null
                 connectionState = "connected"
             },
             onError = { throwable ->
@@ -179,7 +205,7 @@ fun CameraScreen(
 
     Scaffold(
         topBar = {
-            if (!isFullscreen) {
+            if (!isFullscreen && !isInPipMode) {
                 TopAppBar(
                     title = { Text(cameraName) },
                     navigationIcon = {
@@ -194,10 +220,10 @@ fun CameraScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .then(if (isFullscreen) Modifier else Modifier.padding(paddingValues).padding(16.dp)),
-            verticalArrangement = if (isFullscreen) Arrangement.Top else Arrangement.spacedBy(16.dp)
+                .then(if (isFullscreen || isInPipMode) Modifier else Modifier.padding(paddingValues).padding(16.dp)),
+            verticalArrangement = if (isFullscreen || isInPipMode) Arrangement.Top else Arrangement.spacedBy(16.dp)
         ) {
-            if (!isFullscreen) {
+            if (!isFullscreen && !isInPipMode) {
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -223,7 +249,7 @@ fun CameraScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .then(if (isFullscreen) Modifier else Modifier.clip(RoundedCornerShape(18.dp))),
+                    .then(if (isFullscreen || isInPipMode) Modifier else Modifier.clip(RoundedCornerShape(18.dp))),
                 client = client,
                 connectionState = connectionState,
                 cameraName = cameraName,
@@ -231,14 +257,16 @@ fun CameraScreen(
                 motionDetected = motionDetected,
                 receiverAudioEnabled = receiverAudioEnabled,
                 isFullscreen = isFullscreen,
+                isInPipMode = isInPipMode,
                 onToggleAudio = {
                     receiverAudioEnabled = !receiverAudioEnabled
                     client.setRemoteAudioEnabled(receiverAudioEnabled)
                 },
-                onToggleFullscreen = { isFullscreen = !isFullscreen }
+                onToggleFullscreen = { isFullscreen = !isFullscreen },
+                onEnterPip = { onEnterPip(pipOwner) }
             )
 
-            if (!isFullscreen && connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && motionSnapshots.isNotEmpty()) {
+            if (!isFullscreen && !isInPipMode && connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && motionSnapshots.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("Recent motion snapshots", style = MaterialTheme.typography.titleSmall)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -262,7 +290,7 @@ fun CameraScreen(
                 }
             }
 
-            if (!isFullscreen) {
+            if (!isFullscreen && !isInPipMode) {
                 Text(
                     text = "Location: $cameraLocation",
                     style = MaterialTheme.typography.bodyLarge
@@ -322,8 +350,10 @@ private fun ViewerVideoPanel(
     motionDetected: Boolean?,
     receiverAudioEnabled: Boolean,
     isFullscreen: Boolean,
+    isInPipMode: Boolean,
     onToggleAudio: () -> Unit,
-    onToggleFullscreen: () -> Unit
+    onToggleFullscreen: () -> Unit,
+    onEnterPip: () -> Unit
 ) {
     Box(
         modifier = modifier.background(
@@ -357,7 +387,7 @@ private fun ViewerVideoPanel(
             }
         }
 
-        if (connectionState == "connected") {
+        if (connectionState == "connected" && !isInPipMode) {
             Surface(
                 modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
                 shape = RoundedCornerShape(20.dp),
@@ -381,35 +411,47 @@ private fun ViewerVideoPanel(
             }
         }
 
-        Row(
-            modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            FilledTonalIconButton(
-                onClick = onToggleAudio,
-                enabled = connectionState == "connected",
-                modifier = Modifier.size(52.dp),
-                colors = IconButtonDefaults.filledTonalIconButtonColors(
-                    containerColor = if (receiverAudioEnabled) MaterialTheme.colorScheme.secondaryContainer
-                    else MaterialTheme.colorScheme.errorContainer,
-                    contentColor = if (receiverAudioEnabled) MaterialTheme.colorScheme.onSecondaryContainer
-                    else MaterialTheme.colorScheme.onErrorContainer
-                )
+        if (!isInPipMode) {
+            Row(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                Icon(
-                    imageVector = if (receiverAudioEnabled) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
-                    contentDescription = if (receiverAudioEnabled) "Mute received audio" else "Unmute received audio"
-                )
-            }
-            FilledTonalIconButton(
-                onClick = onToggleFullscreen,
-                enabled = connectionState == "connected",
-                modifier = Modifier.size(52.dp)
-            ) {
-                Icon(
-                    imageVector = if (isFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
-                    contentDescription = if (isFullscreen) "Exit fullscreen" else "Enter fullscreen"
-                )
+                FilledTonalIconButton(
+                    onClick = onToggleAudio,
+                    enabled = connectionState == "connected",
+                    modifier = Modifier.size(52.dp),
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(
+                        containerColor = if (receiverAudioEnabled) MaterialTheme.colorScheme.secondaryContainer
+                        else MaterialTheme.colorScheme.errorContainer,
+                        contentColor = if (receiverAudioEnabled) MaterialTheme.colorScheme.onSecondaryContainer
+                        else MaterialTheme.colorScheme.onErrorContainer
+                    )
+                ) {
+                    Icon(
+                        imageVector = if (receiverAudioEnabled) Icons.Filled.VolumeUp else Icons.Filled.VolumeOff,
+                        contentDescription = if (receiverAudioEnabled) "Mute received audio" else "Unmute received audio"
+                    )
+                }
+                FilledTonalIconButton(
+                    onClick = onToggleFullscreen,
+                    enabled = connectionState == "connected",
+                    modifier = Modifier.size(52.dp)
+                ) {
+                    Icon(
+                        imageVector = if (isFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
+                        contentDescription = if (isFullscreen) "Exit fullscreen" else "Enter fullscreen"
+                    )
+                }
+                FilledTonalIconButton(
+                    onClick = onEnterPip,
+                    enabled = connectionState == "connected",
+                    modifier = Modifier.size(52.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.PictureInPictureAlt,
+                        contentDescription = "Enter picture-in-picture"
+                    )
+                }
             }
         }
     }

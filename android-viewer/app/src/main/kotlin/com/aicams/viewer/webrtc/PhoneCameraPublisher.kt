@@ -6,19 +6,14 @@ import android.os.Looper
 import android.util.Log
 import org.webrtc.CapturerObserver
 import org.json.JSONObject
-import org.webrtc.BuiltinAudioDecoderFactoryFactory
-import org.webrtc.BuiltinAudioEncoderFactoryFactory
 import org.webrtc.Camera2Enumerator
 import org.webrtc.CameraVideoCapturer
-import org.webrtc.DefaultVideoDecoderFactory
-import org.webrtc.DefaultVideoEncoderFactory
-import org.webrtc.EglBase
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.PeerConnection
-import org.webrtc.PeerConnectionFactory
+import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
@@ -49,20 +44,21 @@ class PhoneCameraPublisher(
     private val appContext = context.applicationContext
     private val diagnostics = ResourceDiagnostics(appContext, TAG, "camera")
     private val snapshotStore = MotionSnapshotStore(appContext)
-    private val eglBase = EglBase.create()
+    private val eglContext = WebRtcRuntime.eglContext(context)
     private val renderer = SurfaceViewRenderer(context).apply {
-        init(eglBase.eglBaseContext, null)
+        init(eglContext, null)
         setEnableHardwareScaler(true)
         setMirror(true)
     }
     private val httpClient = OkHttpClient()
     private val offerSent = AtomicBoolean(false)
+    private val stopped = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val motionDetector = MotionDetector()
     private var lastMotionAnalysisAt = 0L
     private var publishedInitialMotionState = false
 
-    private val factory: PeerConnectionFactory
+    private val factory = WebRtcRuntime.factory(context)
     private var capturer: CameraVideoCapturer? = null
     private var textureHelper: SurfaceTextureHelper? = null
     private var videoSource: VideoSource? = null
@@ -79,19 +75,6 @@ class PhoneCameraPublisher(
     private var localSignalingServer: LocalWifiSignalingServer? = null
     private var snapshotsDataChannel: DataChannel? = null
 
-    init {
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(appContext)
-                .createInitializationOptions()
-        )
-        factory = PeerConnectionFactory.builder()
-            .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
-            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
-            .setAudioEncoderFactoryFactory(BuiltinAudioEncoderFactoryFactory())
-            .setAudioDecoderFactoryFactory(BuiltinAudioDecoderFactoryFactory())
-            .createPeerConnectionFactory()
-    }
-
     fun getPreviewRenderer(): SurfaceViewRenderer = renderer
 
     @Synchronized
@@ -99,7 +82,7 @@ class PhoneCameraPublisher(
         audioEnabled: Boolean = true,
         connectionMode: StreamConnectionMode = StreamConnectionMode.RELAY_VIA_LAPTOP
     ) {
-        if (started) return
+        if (started || stopped.get()) return
         started = true
         this.connectionMode = connectionMode
         diagnostics.start(
@@ -110,7 +93,9 @@ class PhoneCameraPublisher(
         Thread({ startCaptureAndNegotiate(audioEnabled) }, "PhoneCameraPublisher").start()
     }
 
+    @Synchronized
     private fun startCaptureAndNegotiate(audioEnabled: Boolean) {
+        if (stopped.get()) return
         try {
             val enumerator = Camera2Enumerator(appContext)
             val cameraName = enumerator.deviceNames.firstOrNull { enumerator.isBackFacing(it) }
@@ -123,7 +108,7 @@ class PhoneCameraPublisher(
 
             val source = factory.createVideoSource(false)
             videoSource = source
-            val helper = SurfaceTextureHelper.create("PhoneCameraCapture", eglBase.eglBaseContext)
+            val helper = SurfaceTextureHelper.create("PhoneCameraCapture", eglContext)
                 ?: throw IllegalStateException("Could not initialize camera texture")
             textureHelper = helper
             val sourceObserver = source.capturerObserver
@@ -137,6 +122,7 @@ class PhoneCameraPublisher(
                 }
 
                 override fun onFrameCaptured(frame: VideoFrame) {
+                    if (stopped.get()) return
                     analyzeMotion(frame)
                     sourceObserver.onFrameCaptured(frame)
                 }
@@ -208,7 +194,12 @@ class PhoneCameraPublisher(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer()
         )
-        return factory.createPeerConnection(PeerConnection.RTCConfiguration(iceServers), createPeerObserver())
+        val configuration = PeerConnection.RTCConfiguration(iceServers).apply {
+            // Keep gathering if Android's NetworkMonitor reports Wi-Fi just after the initial
+            // empty gathering cycle completes.
+            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+        }
+        return factory.createPeerConnection(configuration, createPeerObserver())
             ?: throw IllegalStateException("Could not create WebRTC peer connection")
     }
 
@@ -257,19 +248,13 @@ class PhoneCameraPublisher(
             }
             "close" -> {
                 if (message.optString("sessionId") == p2pSessionId) {
-                    peerConnection?.close()
-                    peerConnection = null
-                    snapshotsDataChannel?.dispose()
-                    snapshotsDataChannel = null
+                    disposePeerConnection()
                     p2pSessionId = null
                     onStateChanged(if (connectionMode == StreamConnectionMode.P2P_LOCAL_WIFI) "local camera ready for viewer" else "waiting for P2P viewer")
                 }
             }
             "peer_disconnected" -> {
-                peerConnection?.close()
-                peerConnection = null
-                snapshotsDataChannel?.dispose()
-                snapshotsDataChannel = null
+                disposePeerConnection()
                 p2pSessionId = null
                 onStateChanged("waiting for P2P viewer")
             }
@@ -277,16 +262,18 @@ class PhoneCameraPublisher(
         }
     }
 
+    @Synchronized
     private fun answerP2POffer(sdp: String) {
+        if (stopped.get()) return
         try {
             localDescriptionReady = false
             offerSent.set(false)
+            disposePeerConnection()
             val connection = createPeerConnection()
             peerConnection = connection
-            connection.addTrack(videoTrack ?: throw IllegalStateException("Camera video track is unavailable"), listOf("phone-camera"))
-            audioTrack?.let { connection.addTrack(it, listOf("phone-camera")) }
             connection.setRemoteDescription(object : SdpObserver {
                 override fun onSetSuccess() {
+                    attachTracksToOfferedTransceivers(connection)
                     connection.createAnswer(object : SdpObserver {
                         override fun onCreateSuccess(description: SessionDescription?) {
                             if (description == null) {
@@ -316,6 +303,43 @@ class PhoneCameraPublisher(
         } catch (error: Throwable) {
             fail(error)
         }
+    }
+
+    private fun attachTracksToOfferedTransceivers(connection: PeerConnection) {
+        val cameraVideoTrack = videoTrack
+            ?: throw IllegalStateException("Camera video track is unavailable")
+        var videoAttached = false
+        var audioAttached = false
+
+        connection.transceivers.forEach { transceiver ->
+            when (transceiver.mediaType) {
+                org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO -> {
+                    if (!videoAttached) {
+                        check(transceiver.sender.setTrack(cameraVideoTrack, false)) {
+                            "Could not attach camera video to the offered video transceiver"
+                        }
+                        transceiver.sender.setStreams(listOf("phone-camera"))
+                        transceiver.direction = RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
+                        videoAttached = true
+                    }
+                }
+                org.webrtc.MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO -> {
+                    val cameraAudioTrack = audioTrack
+                    if (!audioAttached && cameraAudioTrack != null) {
+                        check(transceiver.sender.setTrack(cameraAudioTrack, false)) {
+                            "Could not attach microphone audio to the offered audio transceiver"
+                        }
+                        transceiver.sender.setStreams(listOf("phone-camera"))
+                        transceiver.direction = RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
+                        audioAttached = true
+                    }
+                }
+                else -> Unit
+            }
+        }
+
+        check(videoAttached) { "Viewer offer did not contain a video transceiver" }
+        Log.i(TAG, "Attached camera tracks to viewer offer: video=$videoAttached audio=$audioAttached")
     }
 
     fun switchCamera(onCameraFacingChanged: (Boolean) -> Unit, onSwitchFailed: (String) -> Unit) {
@@ -391,6 +415,7 @@ class PhoneCameraPublisher(
 
     private fun createPeerObserver() = object : PeerConnection.Observer {
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {
+            Log.i(TAG, "ICE gathering state changed: ${state?.name ?: "unknown"}")
             if (state == PeerConnection.IceGatheringState.COMPLETE) {
                 peerConnection?.let {
                     if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP) sendP2PAnswerWhenIceReady(it) else sendOfferWhenIceReady(it)
@@ -398,6 +423,7 @@ class PhoneCameraPublisher(
             }
         }
         override fun onConnectionChange(state: PeerConnection.PeerConnectionState?) {
+            Log.i(TAG, "Peer connection state changed: ${state?.name ?: "unknown"}")
             when (state) {
                 PeerConnection.PeerConnectionState.CONNECTED -> onStateChanged(
                     when (connectionMode) {
@@ -412,9 +438,26 @@ class PhoneCameraPublisher(
                 else -> Unit
             }
         }
-        override fun onIceCandidate(candidate: IceCandidate?) = Unit
+        override fun onIceCandidate(candidate: IceCandidate?) {
+            candidate?.let {
+                Log.i(TAG, "Gathered ICE candidate for ${it.sdpMid}: ${it.sdp.take(120)}")
+                mainHandler.postDelayed({
+                    if (!stopped.get()) {
+                        peerConnection?.let { activeConnection ->
+                            if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP) {
+                                sendP2PAnswerWhenIceReady(activeConnection)
+                            } else {
+                                sendOfferWhenIceReady(activeConnection)
+                            }
+                        }
+                    }
+                }, ICE_CANDIDATE_SETTLE_MS)
+            }
+        }
         override fun onSignalingChange(state: PeerConnection.SignalingState?) = Unit
-        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) = Unit
+        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+            Log.i(TAG, "ICE connection state changed: ${state?.name ?: "unknown"}")
+        }
         override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
         override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) = Unit
         override fun onAddStream(stream: org.webrtc.MediaStream?) = Unit
@@ -445,14 +488,21 @@ class PhoneCameraPublisher(
         override fun onRenegotiationNeeded() = Unit
         override fun onAddTrack(receiver: org.webrtc.RtpReceiver?, streams: Array<out org.webrtc.MediaStream>?) = Unit
         override fun onTrack(transceiver: org.webrtc.RtpTransceiver?) = Unit
-        override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState?) = Unit
+        override fun onStandardizedIceConnectionChange(state: PeerConnection.IceConnectionState?) {
+            Log.i(TAG, "Standardized ICE state changed: ${state?.name ?: "unknown"}")
+        }
     }
 
     private fun sendOfferWhenIceReady(connection: PeerConnection) {
-        if (!localDescriptionReady || connection.iceGatheringState() != PeerConnection.IceGatheringState.COMPLETE) return
+        if (!localDescriptionReady) return
         if (!offerSent.compareAndSet(false, true)) return
         val description = connection.localDescription
             ?: return fail(IllegalStateException("Local WebRTC offer is missing"))
+        if (!description.description.contains("a=candidate:")) {
+            offerSent.set(false)
+            Log.w(TAG, "Waiting for a usable ICE candidate before publishing")
+            return
+        }
         Thread({
             try {
                 val payload = JSONObject()
@@ -484,10 +534,15 @@ class PhoneCameraPublisher(
     }
 
     private fun sendP2PAnswerWhenIceReady(connection: PeerConnection) {
-        if (!localDescriptionReady || connection.iceGatheringState() != PeerConnection.IceGatheringState.COMPLETE) return
-        if (!offerSent.compareAndSet(false, true)) return
+        if (!localDescriptionReady) return
         val description = connection.localDescription
             ?: return fail(IllegalStateException("Local P2P answer is missing"))
+        if (!description.description.contains("a=candidate:")) {
+            Log.w(TAG, "ICE gathering completed before a network candidate was available; waiting for Wi-Fi")
+            return
+        }
+        if (!offerSent.compareAndSet(false, true)) return
+        logSdpTransport("Local answer", description.description)
         val sessionId = p2pSessionId ?: return fail(IllegalStateException("P2P signaling session is missing"))
         val sent = signalingTransport?.send(
             JSONObject()
@@ -496,6 +551,17 @@ class PhoneCameraPublisher(
                 .put("sdp", description.description)
         ) ?: false
         if (!sent) fail(IllegalStateException("Could not send P2P answer through signaling server"))
+    }
+
+    private fun logSdpTransport(label: String, sdp: String) {
+        val lines = sdp.lineSequence()
+            .filter { line ->
+                line.startsWith("m=") || line.startsWith("a=mid:") ||
+                    line.startsWith("a=send") || line.startsWith("a=recv") ||
+                    line.startsWith("a=inactive") || line.startsWith("a=candidate:")
+            }
+            .toList()
+        Log.i(TAG, "$label transport (${lines.size} lines): ${lines.joinToString(" | ")}")
     }
 
     private fun sendRecentSnapshots(channel: DataChannel) {
@@ -521,18 +587,24 @@ class PhoneCameraPublisher(
     }
 
     private fun fail(error: Throwable) {
+        if (stopped.get()) return
         Log.e(TAG, "Phone camera publishing failed", error)
         onStateChanged("error")
         onError(error)
     }
 
+    @Synchronized
     fun stop() {
+        if (!stopped.compareAndSet(false, true)) return
         try {
             diagnostics.stop()
-            peerConnection?.close()
-            peerConnection = null
-            snapshotsDataChannel?.dispose()
-            snapshotsDataChannel = null
+            videoTrack?.setEnabled(false)
+            audioTrack?.setEnabled(false)
+            try { capturer?.stopCapture() } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                Log.w(TAG, "Interrupted while stopping camera capture", error)
+            }
+            disposePeerConnection()
             signalingTransport?.close()
             signalingTransport = null
             localSignalingServer?.close()
@@ -544,7 +616,6 @@ class PhoneCameraPublisher(
             audioTrack = null
             audioSource?.dispose()
             audioSource = null
-            capturer?.stopCapture()
             capturer?.dispose()
             capturer = null
             videoSource?.dispose()
@@ -553,14 +624,24 @@ class PhoneCameraPublisher(
             textureHelper = null
             snapshotStore.close()
             renderer.release()
-            eglBase.release()
-            factory.dispose()
         } catch (error: Exception) {
             Log.w(TAG, "Error while stopping phone camera publisher", error)
         }
     }
 
+    @Synchronized
+    private fun disposePeerConnection() {
+        snapshotsDataChannel?.unregisterObserver()
+        snapshotsDataChannel?.dispose()
+        snapshotsDataChannel = null
+        val connection = peerConnection
+        peerConnection = null
+        connection?.close()
+        connection?.dispose()
+    }
+
     private companion object {
+        const val ICE_CANDIDATE_SETTLE_MS = 300L
         const val MOTION_ANALYSIS_INTERVAL_MS = 500L
         const val MOTION_SAMPLE_COLUMNS = 32
         const val MOTION_SAMPLE_ROWS = 18

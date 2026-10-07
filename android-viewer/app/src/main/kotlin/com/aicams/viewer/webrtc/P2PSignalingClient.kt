@@ -9,6 +9,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** WebSocket signaling only; audio/video remain on the peer-to-peer WebRTC connection. */
 internal class P2PSignalingClient(
@@ -19,6 +20,7 @@ internal class P2PSignalingClient(
     private val onMessage: (JSONObject) -> Unit,
     private val onState: (String) -> Unit
 ) : SignalingTransport {
+    private val closed = AtomicBoolean(false)
     private val client = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
@@ -33,11 +35,16 @@ internal class P2PSignalingClient(
             .build()
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (closed.get()) {
+                    webSocket.close(1000, "screen stopped")
+                    return
+                }
                 onState("signaling connected")
                 initialMessage?.let { webSocket.send(it.toString()) }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (closed.get()) return
                 try {
                     onMessage(JSONObject(text))
                 } catch (_: Exception) {
@@ -46,20 +53,25 @@ internal class P2PSignalingClient(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                onState("signaling error: ${t.message ?: "connection failed"}")
+                if (!closed.get()) {
+                    onState("signaling error: could not reach the laptop signaling service")
+                }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                onState("signaling closed")
+                if (!closed.get()) onState("signaling closed")
             }
         })
     }
 
-    override fun send(message: JSONObject): Boolean = webSocket.send(message.toString())
+    override fun send(message: JSONObject): Boolean =
+        !closed.get() && webSocket.send(message.toString())
 
     override fun close() {
+        if (!closed.compareAndSet(false, true)) return
         webSocket.close(1000, "screen stopped")
         client.dispatcher.executorService.shutdown()
+        client.connectionPool.evictAll()
     }
 
     companion object {

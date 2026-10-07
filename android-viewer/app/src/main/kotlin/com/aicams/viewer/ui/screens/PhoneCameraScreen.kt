@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalIconButton
@@ -40,6 +41,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -50,7 +52,13 @@ import com.aicams.viewer.webrtc.StreamConnectionMode
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PhoneCameraScreen(navController: NavHostController) {
+fun PhoneCameraScreen(
+    navController: NavHostController,
+    isInPipMode: Boolean = false,
+    onConfigurePip: (Any, Boolean) -> Unit = { _, _ -> },
+    onClearPip: (Any) -> Unit = {},
+    onEnterPip: (Any) -> Boolean = { false }
+) {
     var status by remember { mutableStateOf("Camera is stopped") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isStreaming by remember { mutableStateOf(false) }
@@ -61,6 +69,8 @@ fun PhoneCameraScreen(navController: NavHostController) {
     var motionDetectionActive by remember { mutableStateOf(false) }
     var motionDetected by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val view = LocalView.current
+    val pipOwner = remember { Any() }
     val publisher = remember(context) {
         PhoneCameraPublisher(
             context = context.applicationContext,
@@ -93,26 +103,52 @@ fun PhoneCameraScreen(navController: NavHostController) {
         onDispose { publisher.stop() }
     }
 
+    androidx.compose.runtime.LaunchedEffect(isStreaming) {
+        onConfigurePip(pipOwner, isStreaming)
+    }
+
+    DisposableEffect(pipOwner) {
+        onDispose { onClearPip(pipOwner) }
+    }
+
+    DisposableEffect(view, isStreaming) {
+        val wasKeepingScreenOn = view.keepScreenOn
+        if (isStreaming) view.keepScreenOn = true
+        onDispose { view.keepScreenOn = wasKeepingScreenOn }
+    }
+
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = { Text("Use Phone as Camera") },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+            if (!isInPipMode) {
+                TopAppBar(
+                    title = { Text("Use Phone as Camera") },
+                    navigationIcon = {
+                        IconButton(onClick = { navController.popBackStack() }) {
+                            Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    },
+                    actions = {
+                        IconButton(
+                            onClick = { onEnterPip(pipOwner) },
+                            enabled = isStreaming
+                        ) {
+                            Icon(
+                                Icons.Filled.PictureInPictureAlt,
+                                contentDescription = "Enter picture-in-picture"
+                            )
+                        }
                     }
-                }
-            )
+                )
+            }
         }
     ) { paddingValues ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(paddingValues)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+                .then(if (isInPipMode) Modifier else Modifier.padding(paddingValues).padding(16.dp)),
+            verticalArrangement = if (isInPipMode) Arrangement.Top else Arrangement.spacedBy(16.dp)
         ) {
-            Text(
+            if (!isInPipMode) Text(
                 text = when (connectionMode) {
                     StreamConnectionMode.RELAY_VIA_LAPTOP -> "Media relay: ${Constants.API_BASE_URL}"
                     StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "Laptop signaling: ${Constants.API_BASE_URL}"
@@ -120,7 +156,7 @@ fun PhoneCameraScreen(navController: NavHostController) {
                 },
                 style = MaterialTheme.typography.bodyMedium
             )
-            Row(
+            if (!isInPipMode) Row(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -137,15 +173,14 @@ fun PhoneCameraScreen(navController: NavHostController) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
-                    .clip(RoundedCornerShape(16.dp))
-                    .padding(2.dp),
+                    .then(if (isInPipMode) Modifier else Modifier.clip(RoundedCornerShape(16.dp)).padding(2.dp)),
                 contentAlignment = Alignment.Center
             ) {
                 AndroidView(
                     factory = { publisher.getPreviewRenderer() },
                     modifier = Modifier.fillMaxSize()
                 )
-                if (motionDetectionActive) {
+                if (motionDetectionActive && !isInPipMode) {
                     Surface(
                         modifier = Modifier
                             .align(Alignment.TopStart)
@@ -169,7 +204,7 @@ fun PhoneCameraScreen(navController: NavHostController) {
                         )
                     }
                 }
-                if (isStreaming) {
+                if (isStreaming && !isInPipMode) {
                     Row(
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
@@ -223,9 +258,9 @@ fun PhoneCameraScreen(navController: NavHostController) {
                     }
                 }
             }
-            Text("Status: $status", style = MaterialTheme.typography.titleMedium)
-            errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            Text(
+            if (!isInPipMode) Text("Status: $status", style = MaterialTheme.typography.titleMedium)
+            if (!isInPipMode) errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            if (!isInPipMode) Text(
                 when (connectionMode) {
                     StreamConnectionMode.RELAY_VIA_LAPTOP -> "Keep this screen open while streaming. Start the laptop relay first; media passes through the laptop."
                     StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "Keep this screen open. Start the laptop service for signaling; media should flow directly between phones."
@@ -233,7 +268,7 @@ fun PhoneCameraScreen(navController: NavHostController) {
                 },
                 style = MaterialTheme.typography.bodySmall
             )
-            Button(
+            if (!isInPipMode) Button(
                 onClick = {
                     mediaPermissionLauncher.launch(
                         arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
@@ -244,7 +279,7 @@ fun PhoneCameraScreen(navController: NavHostController) {
             ) {
                 Text(if (connectionMode == StreamConnectionMode.RELAY_VIA_LAPTOP) "Start Camera + Audio Stream" else "Start ${connectionMode.label()} Camera")
             }
-            Button(onClick = { navController.popBackStack() }, modifier = Modifier.fillMaxWidth()) {
+            if (!isInPipMode) Button(onClick = { navController.popBackStack() }, modifier = Modifier.fillMaxWidth()) {
                 Text("Stop and Return")
             }
         }
