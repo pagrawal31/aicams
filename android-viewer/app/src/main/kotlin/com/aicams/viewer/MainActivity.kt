@@ -1,6 +1,7 @@
 package com.aicams.viewer
 
 import android.app.PictureInPictureParams
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.os.Build
@@ -22,6 +23,7 @@ import com.aicams.viewer.ui.screens.CameraScreen
 import com.aicams.viewer.ui.screens.DashboardScreen
 import com.aicams.viewer.ui.screens.LoginScreen
 import com.aicams.viewer.ui.screens.PhoneCameraScreen
+import com.aicams.viewer.ui.screens.SettingsScreen
 import com.aicams.viewer.ui.theme.AICAMsViewerTheme
 import dagger.hilt.android.AndroidEntryPoint
 import java.net.URLDecoder
@@ -51,6 +53,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // With singleTask, launcher taps and PiP re-entry are delivered to this activity
+        // instead of building a stack of invisible MainActivity instances.
+        setIntent(intent)
     }
 
     fun configurePictureInPicture(owner: Any, enabled: Boolean) {
@@ -144,6 +153,9 @@ fun AppNavigation(
                 onClearPip = onClearPip,
                 onEnterPip = onEnterPip
             )
+        }
+        composable("settings") {
+            SettingsScreen(navController)
         }
         composable("camera") {
             CameraScreen(

@@ -4,6 +4,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+*.apk
+*.aar
+*.ap_
+**/build/
+*.aab
 .venv/
 venv/
 

@@ -25,4 +25,16 @@ class MotionSnapshotTransferTest {
         val tooLarge = ByteArray(MotionSnapshotTransfer.MAX_SNAPSHOT_BYTES + 1)
         assertTrue(MotionSnapshotTransfer.messages(listOf(MotionSnapshot(1L, tooLarge))).isEmpty())
     }
+
+    @Test
+    fun boundsSnapshotHistoryAtTransferLimit() {
+        val snapshots = (0..MotionSnapshotTransfer.MAX_SNAPSHOTS).map { index ->
+            MotionSnapshot(index.toLong(), byteArrayOf(index.toByte()))
+        }
+
+        val starts = MotionSnapshotTransfer.messages(snapshots)
+            .count { it.type == MotionSnapshotTransfer.EVENT_START }
+
+        assertEquals(MotionSnapshotTransfer.MAX_SNAPSHOTS, starts)
+    }
 }

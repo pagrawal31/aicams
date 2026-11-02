@@ -10,7 +10,7 @@ import java.util.concurrent.Executors
 
 internal data class MotionSnapshot(val timestampMs: Long, val jpegBytes: ByteArray)
 
-/** Keeps only a few low-resolution motion-event JPEGs in app-private storage. */
+/** Keeps recent low-resolution motion-event JPEGs in app-private storage. */
 internal class MotionSnapshotStore(context: Context) {
     private val directory = File(context.applicationContext.filesDir, "motion_snapshots").apply { mkdirs() }
     private val executor = Executors.newSingleThreadExecutor { task ->
@@ -108,7 +108,7 @@ internal class MotionSnapshotStore(context: Context) {
 
     private companion object {
         const val TAG = "AICAMsMotionSnapshot"
-        const val MAX_SNAPSHOTS = 3
+        const val MAX_SNAPSHOTS = 100
         const val MAX_AGE_MS = 24L * 60L * 60L * 1000L
         const val THUMBNAIL_WIDTH = 320
         const val THUMBNAIL_HEIGHT = 180

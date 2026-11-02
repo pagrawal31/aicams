@@ -13,6 +13,7 @@ import org.webrtc.AudioTrack
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.PeerConnection
+import org.webrtc.RtpSender
 import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
@@ -22,6 +23,7 @@ import org.webrtc.VideoSource
 import org.webrtc.VideoFrame
 import org.webrtc.VideoTrack
 import org.webrtc.DataChannel
+import com.aicams.viewer.settings.CameraBatterySettings
 import com.aicams.viewer.utils.Constants
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -39,7 +41,8 @@ class PhoneCameraPublisher(
     private val serverBaseUrl: String,
     private val onStateChanged: (String) -> Unit,
     private val onError: (Throwable) -> Unit,
-    private val onMotionChanged: (Boolean) -> Unit
+    private val onMotionChanged: (Boolean) -> Unit,
+    private val batterySettings: CameraBatterySettings = CameraBatterySettings()
 ) {
     private val appContext = context.applicationContext
     private val diagnostics = ResourceDiagnostics(appContext, TAG, "camera")
@@ -74,12 +77,14 @@ class PhoneCameraPublisher(
     private var signalingTransport: SignalingTransport? = null
     private var localSignalingServer: LocalWifiSignalingServer? = null
     private var snapshotsDataChannel: DataChannel? = null
+    private var currentCaptureProfile: CaptureProfile? = null
 
     fun getPreviewRenderer(): SurfaceViewRenderer = renderer
 
     @Synchronized
     fun start(
-        audioEnabled: Boolean = true,
+        audioAvailable: Boolean = true,
+        initialAudioEnabled: Boolean = true,
         connectionMode: StreamConnectionMode = StreamConnectionMode.RELAY_VIA_LAPTOP
     ) {
         if (started || stopped.get()) return
@@ -90,11 +95,14 @@ class PhoneCameraPublisher(
             modeProvider = { connectionMode.name }
         )
         onStateChanged("starting camera")
-        Thread({ startCaptureAndNegotiate(audioEnabled) }, "PhoneCameraPublisher").start()
+        Thread(
+            { startCaptureAndNegotiate(audioAvailable, initialAudioEnabled) },
+            "PhoneCameraPublisher"
+        ).start()
     }
 
     @Synchronized
-    private fun startCaptureAndNegotiate(audioEnabled: Boolean) {
+    private fun startCaptureAndNegotiate(audioAvailable: Boolean, initialAudioEnabled: Boolean) {
         if (stopped.get()) return
         try {
             val enumerator = Camera2Enumerator(appContext)
@@ -127,19 +135,21 @@ class PhoneCameraPublisher(
                     sourceObserver.onFrameCaptured(frame)
                 }
             })
-            cameraCapturer.startCapture(1280, 720, 24)
+            val initialProfile = captureProfile(viewerConnected = false)
+            cameraCapturer.startCapture(initialProfile.width, initialProfile.height, initialProfile.fps)
+            currentCaptureProfile = initialProfile
 
             val track = factory.createVideoTrack("phone-camera-video", source)
             videoTrack = track
             track.setEnabled(true)
-            track.addSink(renderer)
+            if (!batterySettings.suppressLocalPreview) track.addSink(renderer)
 
-            if (audioEnabled) {
+            if (audioAvailable) {
                 val microphoneSource = factory.createAudioSource(MediaConstraints())
                 audioSource = microphoneSource
                 val microphoneTrack = factory.createAudioTrack("phone-camera-audio", microphoneSource)
                 audioTrack = microphoneTrack
-                microphoneTrack.setEnabled(true)
+                microphoneTrack.setEnabled(initialAudioEnabled)
             }
 
             when (connectionMode) {
@@ -206,7 +216,8 @@ class PhoneCameraPublisher(
     private fun startRelayPublishing(track: VideoTrack) {
         val connection = createPeerConnection()
         peerConnection = connection
-        connection.addTrack(track, listOf("phone-camera"))
+        val videoSender = connection.addTrack(track, listOf("phone-camera"))
+        applyVideoBitrateLimit(videoSender)
         audioTrack?.let { connection.addTrack(it, listOf("phone-camera")) }
 
         onStateChanged("connecting to laptop relay")
@@ -249,12 +260,14 @@ class PhoneCameraPublisher(
             "close" -> {
                 if (message.optString("sessionId") == p2pSessionId) {
                     disposePeerConnection()
+                    applyCaptureProfile(viewerConnected = false)
                     p2pSessionId = null
                     onStateChanged(if (connectionMode == StreamConnectionMode.P2P_LOCAL_WIFI) "local camera ready for viewer" else "waiting for P2P viewer")
                 }
             }
             "peer_disconnected" -> {
                 disposePeerConnection()
+                applyCaptureProfile(viewerConnected = false)
                 p2pSessionId = null
                 onStateChanged("waiting for P2P viewer")
             }
@@ -320,6 +333,7 @@ class PhoneCameraPublisher(
                         }
                         transceiver.sender.setStreams(listOf("phone-camera"))
                         transceiver.direction = RtpTransceiver.RtpTransceiverDirection.SEND_ONLY
+                        applyVideoBitrateLimit(transceiver.sender)
                         videoAttached = true
                     }
                 }
@@ -362,6 +376,38 @@ class PhoneCameraPublisher(
 
     fun setAudioEnabled(enabled: Boolean) {
         audioTrack?.setEnabled(enabled)
+    }
+
+    @Synchronized
+    private fun applyCaptureProfile(viewerConnected: Boolean) {
+        if (stopped.get()) return
+        val profile = captureProfile(viewerConnected)
+        if (profile == currentCaptureProfile) return
+        try {
+            capturer?.changeCaptureFormat(profile.width, profile.height, profile.fps)
+            currentCaptureProfile = profile
+            Log.i(TAG, "Camera capture profile=${profile.width}x${profile.height}@${profile.fps}")
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not change camera capture profile", error)
+        }
+    }
+
+    private fun captureProfile(viewerConnected: Boolean): CaptureProfile = when {
+        !viewerConnected && batterySettings.useLowPowerWhileWaiting -> IDLE_CAPTURE_PROFILE
+        batterySettings.useReducedVideoQuality -> BATTERY_CAPTURE_PROFILE
+        else -> DEFAULT_CAPTURE_PROFILE
+    }
+
+    private fun applyVideoBitrateLimit(sender: RtpSender) {
+        if (!batterySettings.capVideoBitrate) return
+        val parameters = sender.parameters
+        parameters.encodings.forEach { encoding ->
+            encoding.maxBitrateBps = BATTERY_VIDEO_BITRATE_BPS
+            encoding.maxFramerate = BATTERY_CAPTURE_PROFILE.fps
+        }
+        if (!sender.setParameters(parameters)) {
+            Log.w(TAG, "WebRTC rejected Battery Saver bitrate settings")
+        }
     }
 
     private fun analyzeMotion(frame: VideoFrame) {
@@ -425,16 +471,22 @@ class PhoneCameraPublisher(
         override fun onConnectionChange(state: PeerConnection.PeerConnectionState?) {
             Log.i(TAG, "Peer connection state changed: ${state?.name ?: "unknown"}")
             when (state) {
-                PeerConnection.PeerConnectionState.CONNECTED -> onStateChanged(
-                    when (connectionMode) {
-                        StreamConnectionMode.RELAY_VIA_LAPTOP -> "streaming to laptop relay"
-                        StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "streaming directly (laptop signaling)"
-                        StreamConnectionMode.P2P_LOCAL_WIFI -> "streaming directly (local Wi-Fi)"
-                    }
-                )
+                PeerConnection.PeerConnectionState.CONNECTED -> {
+                    applyCaptureProfile(viewerConnected = true)
+                    onStateChanged(
+                        when (connectionMode) {
+                            StreamConnectionMode.RELAY_VIA_LAPTOP -> "streaming to laptop relay"
+                            StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "streaming directly (laptop signaling)"
+                            StreamConnectionMode.P2P_LOCAL_WIFI -> "streaming directly (local Wi-Fi)"
+                        }
+                    )
+                }
                 PeerConnection.PeerConnectionState.FAILED,
                 PeerConnection.PeerConnectionState.DISCONNECTED,
-                PeerConnection.PeerConnectionState.CLOSED -> onStateChanged("connection failed")
+                PeerConnection.PeerConnectionState.CLOSED -> {
+                    applyCaptureProfile(viewerConnected = false)
+                    onStateChanged("connection failed")
+                }
                 else -> Unit
             }
         }
@@ -641,9 +693,15 @@ class PhoneCameraPublisher(
     }
 
     private companion object {
+        data class CaptureProfile(val width: Int, val height: Int, val fps: Int)
+
         const val ICE_CANDIDATE_SETTLE_MS = 300L
         const val MOTION_ANALYSIS_INTERVAL_MS = 500L
         const val MOTION_SAMPLE_COLUMNS = 32
         const val MOTION_SAMPLE_ROWS = 18
+        const val BATTERY_VIDEO_BITRATE_BPS = 500_000
+        val DEFAULT_CAPTURE_PROFILE = CaptureProfile(1280, 720, 24)
+        val BATTERY_CAPTURE_PROFILE = CaptureProfile(640, 360, 15)
+        val IDLE_CAPTURE_PROFILE = CaptureProfile(320, 180, 3)
     }
 }
