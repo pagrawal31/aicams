@@ -106,3 +106,45 @@ Unit tests, debug APK assembly, and Android lint passed. The updated APK was suc
 Enabled continual ICE gathering on viewer and publisher connections, prevented candidate-less offers and answers from being sent, and added a short settling interval after real host/STUN candidates arrive before sending the complete SDP. Also made repeated callbacks for the same remote video track idempotent. This preserves the process-wide WebRTC runtime used to prevent the earlier native sleep crash while removing the network-monitor startup race.
 
 Unit tests, debug APK assembly, and Android lint passed. The corrected APK was installed on both physical phones. A fresh Local Wi-Fi session reached ICE/WebRTC `CONNECTED`; receiver logs showed 119–120 frames received and rendered per four seconds (approximately 30 FPS), and a device screenshot visually confirmed the live camera image, motion status, and recent motion snapshots.
+
+## 13. Clarify Local Wi-Fi bandwidth and hotspot support
+
+**Prompt:** Does Local Wi-Fi use bandwidth, and will the two devices connect through a mobile hotspot?
+
+**Response:** Local Wi-Fi uses Wi-Fi/LAN bandwidth because the WebRTC video and audio stream travels directly between the camera and viewer phones. It normally does not use internet/mobile-data allowance when both peers can use their local hotspot addresses; only STUN discovery may exchange a very small amount of internet traffic when the hotspot has internet access. Video is the main load and WebRTC adapts its bitrate to the available link.
+
+A hotspot can work when both app phones are connected to the same hotspot, provided the hotspot permits client-to-client communication and mDNS/NSD discovery. A third phone or dedicated hotspot serving both app phones is the most reliable arrangement. Using one of the two app phones as the hotspot may be device/OEM-dependent because Android hotspots can isolate clients or fail to expose/forward mDNS discovery on the hotspot interface. The current app discovers the camera through Android NSD/mDNS and has no manual-IP fallback, so discovery will fail on a hotspot that blocks multicast even if direct IP traffic would otherwise work.
+
+## 14. Diagnose viewer UI not reopening while motion audio continues
+
+**Prompt:** The viewer app is not opening; is it crashing? Motion-detection audio still plays.
+
+**Response:** ADB confirmed that the viewer is not crashing. Its process remains alive, WebRTC continues receiving roughly 1.8–2.3 Mbps, video frames and motion events continue arriving, and the motion alert sound is played. Android has the app task stuck in Picture-in-Picture (`pinned`) mode while the launcher is foreground, but the renderer has no visible surface.
+
+The task contains 81 `MainActivity` records because `MainActivity` uses the default `standard` launch mode. Each tap on the launcher icon while the existing activity is pinned creates another activity record inside the pinned task instead of restoring the existing activity. The newest records remain in `INITIALIZING` with no windows, leaving the original live session running invisibly. There is no new Java or native crash in the crash buffer or process-exit history.
+
+Immediate recovery is to force-stop AICAMs Viewer from Android App Info and open it again. The durable code fix is to make `MainActivity` a single reusable task/activity for launcher and PiP re-entry (for example, `singleTask` plus intent handling) so repeated launcher taps expand/reuse the existing session rather than stacking activities. This prompt performed diagnosis only; that code change has not yet been applied.
+
+## 15. Fix viewer launch while an existing session is in PiP
+
+**Prompt:** Fix the code so the viewer app opens instead of remaining invisible while motion audio continues.
+
+**Response:** Configured `MainActivity` with Android's `singleTask` launch mode and added `onNewIntent` handling. Launcher taps now return the existing activity to the foreground instead of creating another `MainActivity` inside the pinned PiP task. This also preserves the active WebRTC session during PiP-to-fullscreen re-entry.
+
+Unit tests, debug APK assembly, and Android lint passed. The fixed APK was installed on the viewer phone, clearing the previously corrupted 81-activity task. Five repeated launch attempts were delivered to the same activity and the task remained at size one. A physical Home/PiP test put that single activity into pinned mode; launching the app again reused the same activity, returned the task to fullscreen, and visibly restored the live video UI without disconnecting the stream.
+
+## 16. Show motion snapshots in a sliding history carousel
+
+**Prompt:** On the viewer, display as many streamed images as possible in a carousel instead of showing only three, including older images by sliding.
+
+**Response:** Replaced the fixed three-thumbnail row with a lazy horizontal carousel that displays every snapshot currently retained, newest first, and shows the current snapshot count. Increased camera-side private storage, initial history transfer, and viewer-side decoded history from three to 100 snapshots while retaining the existing 24-hour expiry. The bound prevents long-running sessions from exhausting storage or the viewer heap; images deleted by the former three-item policy cannot be recovered, while new captures now accumulate up to the new limit.
+
+Added unit coverage for the expanded transfer bound. Unit tests, debug APK assembly, and Android lint passed. Matching retention builds were installed on both phones. Physical verification showed four and then five snapshots in the viewer, and a horizontal swipe moved the carousel to older timestamps.
+
+## 17. Compact the viewer status and remove duplicate back navigation
+
+**Prompt:** Remove the bottom `Back to Cameras` button because it duplicates the back arrow, and move `Status: Live` to the top as a green icon to free space.
+
+**Response:** Removed the bottom `Back to Cameras` button and the large bottom status text. The top app bar now contains a compact accessible status dot: green when live, amber while connecting, and red when disconnected. The back arrow remains the single route back to the camera list, leaving more vertical space for the live stream and snapshot carousel.
+
+Unit tests, debug APK assembly, and Android lint passed. The updated viewer APK was installed and physically verified with a green live indicator, the duplicate controls absent, and the expanded carousel visible below the stream. The disconnected state was also observed with the indicator correctly changing to red while the retained carousel remained accessible.

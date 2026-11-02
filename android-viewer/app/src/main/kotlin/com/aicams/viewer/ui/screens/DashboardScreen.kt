@@ -7,6 +7,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExitToApp
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -77,6 +78,9 @@ fun DashboardScreen(navController: NavHostController) {
                 actions = {
                     IconButton(onClick = { navController.navigate("phone-camera") }) {
                         Text("📷", style = MaterialTheme.typography.titleLarge)
+                    }
+                    IconButton(onClick = { navController.navigate("settings") }) {
+                        Icon(Icons.Filled.Settings, "Settings")
                     }
                     IconButton(onClick = { navController.navigate("login") }) {
                         Icon(Icons.Filled.ExitToApp, "Logout")

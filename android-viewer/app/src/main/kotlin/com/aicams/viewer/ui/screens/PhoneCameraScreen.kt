@@ -1,6 +1,7 @@
 package com.aicams.viewer.ui.screens
 
 import android.Manifest
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -46,6 +47,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.navigation.NavHostController
+import com.aicams.viewer.CameraStreamingForegroundService
+import com.aicams.viewer.settings.CameraBatterySettingsStore
 import com.aicams.viewer.utils.Constants
 import com.aicams.viewer.webrtc.PhoneCameraPublisher
 import com.aicams.viewer.webrtc.StreamConnectionMode
@@ -64,12 +67,13 @@ fun PhoneCameraScreen(
     var isStreaming by remember { mutableStateOf(false) }
     var isFrontCamera by remember { mutableStateOf(false) }
     var audioAvailable by remember { mutableStateOf(false) }
-    var audioEnabled by remember { mutableStateOf(true) }
     var connectionMode by remember { mutableStateOf(StreamConnectionMode.RELAY_VIA_LAPTOP) }
     var motionDetectionActive by remember { mutableStateOf(false) }
     var motionDetected by remember { mutableStateOf(false) }
     val context = LocalContext.current
     val view = LocalView.current
+    val batterySettings = remember(context) { CameraBatterySettingsStore(context).load() }
+    var audioEnabled by remember { mutableStateOf(!batterySettings.startWithMicrophoneOff) }
     val pipOwner = remember { Any() }
     val publisher = remember(context) {
         PhoneCameraPublisher(
@@ -77,7 +81,8 @@ fun PhoneCameraScreen(
             serverBaseUrl = Constants.API_BASE_URL,
             onStateChanged = { status = it },
             onError = { errorMessage = it.message ?: "Unable to publish camera" },
-            onMotionChanged = { motionDetected = it }
+            onMotionChanged = { motionDetected = it },
+            batterySettings = batterySettings
         )
     }
     val mediaPermissionLauncher = rememberLauncherForActivityResult(
@@ -86,11 +91,18 @@ fun PhoneCameraScreen(
         if (granted[Manifest.permission.CAMERA] == true) {
             errorMessage = null
             audioAvailable = granted[Manifest.permission.RECORD_AUDIO] == true
-            audioEnabled = audioAvailable
+            audioEnabled = audioAvailable && !batterySettings.startWithMicrophoneOff
             isStreaming = true
             motionDetectionActive = true
             motionDetected = false
-            publisher.start(audioEnabled = audioAvailable, connectionMode = connectionMode)
+            if (batterySettings.permitScreenSleep) {
+                CameraStreamingForegroundService.start(context, audioAvailable)
+            }
+            publisher.start(
+                audioAvailable = audioAvailable,
+                initialAudioEnabled = audioEnabled,
+                connectionMode = connectionMode
+            )
             if (!audioAvailable) {
                 errorMessage = "Microphone permission was not granted; streaming video only."
             }
@@ -100,7 +112,10 @@ fun PhoneCameraScreen(
     }
 
     DisposableEffect(publisher) {
-        onDispose { publisher.stop() }
+        onDispose {
+            publisher.stop()
+            CameraStreamingForegroundService.stop(context)
+        }
     }
 
     androidx.compose.runtime.LaunchedEffect(isStreaming) {
@@ -113,7 +128,7 @@ fun PhoneCameraScreen(
 
     DisposableEffect(view, isStreaming) {
         val wasKeepingScreenOn = view.keepScreenOn
-        if (isStreaming) view.keepScreenOn = true
+        if (isStreaming && !batterySettings.permitScreenSleep) view.keepScreenOn = true
         onDispose { view.keepScreenOn = wasKeepingScreenOn }
     }
 
@@ -176,10 +191,18 @@ fun PhoneCameraScreen(
                     .then(if (isInPipMode) Modifier else Modifier.clip(RoundedCornerShape(16.dp)).padding(2.dp)),
                 contentAlignment = Alignment.Center
             ) {
-                AndroidView(
-                    factory = { publisher.getPreviewRenderer() },
-                    modifier = Modifier.fillMaxSize()
-                )
+                if (batterySettings.suppressLocalPreview) {
+                    Text(
+                        "Local preview is off to save battery",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    AndroidView(
+                        factory = { publisher.getPreviewRenderer() },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
                 if (motionDetectionActive && !isInPipMode) {
                     Surface(
                         modifier = Modifier
@@ -259,6 +282,11 @@ fun PhoneCameraScreen(
                 }
             }
             if (!isInPipMode) Text("Status: $status", style = MaterialTheme.typography.titleMedium)
+            if (!isInPipMode && batterySettings.enabled) Text(
+                "Battery Saver profile enabled",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary
+            )
             if (!isInPipMode) errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!isInPipMode) Text(
                 when (connectionMode) {
@@ -272,6 +300,13 @@ fun PhoneCameraScreen(
                 onClick = {
                     mediaPermissionLauncher.launch(
                         arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+                            .let { mediaPermissions ->
+                                if (batterySettings.permitScreenSleep && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                    mediaPermissions + Manifest.permission.POST_NOTIFICATIONS
+                                } else {
+                                    mediaPermissions
+                                }
+                            }
                     )
                 },
                 enabled = !isStreaming,

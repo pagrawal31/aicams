@@ -27,7 +27,7 @@ internal object MotionSnapshotTransfer {
     const val EVENT_START = "snapshot_start"
     const val EVENT_CHUNK = "snapshot_chunk"
     const val CHUNK_CHARACTERS = 8_000
-    const val MAX_SNAPSHOTS = 3
+    const val MAX_SNAPSHOTS = 100
     const val MAX_CHUNKS_PER_SNAPSHOT = 128
     const val MAX_SNAPSHOT_BYTES = 512 * 1024
 

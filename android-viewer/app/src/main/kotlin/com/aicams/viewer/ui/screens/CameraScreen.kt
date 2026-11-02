@@ -18,10 +18,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Circle
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.PictureInPictureAlt
@@ -69,7 +72,8 @@ import java.text.DateFormat
 import java.util.Date
 
 private const val TAG = "AICAMsCameraScreen"
-private const val MAX_VISIBLE_MOTION_SNAPSHOTS = 3
+// Keep a substantial history without allowing decoded bitmaps to grow without bound.
+private const val MAX_MOTION_SNAPSHOTS = 100
 
 private data class ReceivedMotionSnapshot(val timestampMs: Long, val bitmap: Bitmap)
 
@@ -182,8 +186,8 @@ fun CameraScreen(
                     motionSnapshots.add(0, ReceivedMotionSnapshot(timestampMs, bitmap))
                     motionSnapshots.sortByDescending { it.timestampMs }
                 }
-                while (motionSnapshots.size > MAX_VISIBLE_MOTION_SNAPSHOTS) {
-                    motionSnapshots.removeAt(motionSnapshots.lastIndex)
+                while (motionSnapshots.size > MAX_MOTION_SNAPSHOTS) {
+                    motionSnapshots.removeAt(motionSnapshots.lastIndex).bitmap.recycle()
                 }
             }
         )
@@ -212,6 +216,22 @@ fun CameraScreen(
                         IconButton(onClick = { navController.popBackStack() }) {
                             Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
                         }
+                    },
+                    actions = {
+                        Icon(
+                            imageVector = Icons.Filled.Circle,
+                            contentDescription = when (connectionState) {
+                                "connected" -> "Status: Live"
+                                "failed" -> "Status: Not connected"
+                                else -> "Status: Connecting"
+                            },
+                            tint = when (connectionState) {
+                                "connected" -> Color(0xFF2E7D32)
+                                "failed" -> MaterialTheme.colorScheme.error
+                                else -> Color(0xFFF9A825)
+                            },
+                            modifier = Modifier.padding(end = 16.dp).size(16.dp)
+                        )
                     }
                 )
             }
@@ -268,17 +288,26 @@ fun CameraScreen(
 
             if (!isFullscreen && !isInPipMode && connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && motionSnapshots.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Recent motion snapshots", style = MaterialTheme.typography.titleSmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        motionSnapshots.forEach { snapshot ->
+                    Text(
+                        "Motion snapshots (${motionSnapshots.size})",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(
+                            items = motionSnapshots,
+                            key = { snapshot -> snapshot.timestampMs }
+                        ) { snapshot ->
                             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                 Image(
                                     bitmap = snapshot.bitmap.asImageBitmap(),
                                     contentDescription = "Motion snapshot at ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(snapshot.timestampMs))}",
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier
-                                        .size(width = 88.dp, height = 54.dp)
-                                        .clip(RoundedCornerShape(6.dp))
+                                        .size(width = 132.dp, height = 74.dp)
+                                        .clip(RoundedCornerShape(8.dp))
                                 )
                                 Text(
                                     DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(snapshot.timestampMs)),
@@ -296,20 +325,6 @@ fun CameraScreen(
                     style = MaterialTheme.typography.bodyLarge
                 )
 
-                Text(
-                    text = when (connectionState) {
-                        "connected" -> "Status: Live"
-                        "failed" -> "Status: Not connected"
-                        else -> "Status: Connecting"
-                    },
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = when (connectionState) {
-                        "failed" -> MaterialTheme.colorScheme.error
-                        "connected" -> MaterialTheme.colorScheme.primary
-                        else -> MaterialTheme.colorScheme.primary
-                    }
-                )
-
                 if (connectionState == "failed") {
                     Button(
                         onClick = {
@@ -323,12 +338,6 @@ fun CameraScreen(
                     }
                 }
 
-                Button(
-                    onClick = { navController.popBackStack() },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Back to Cameras")
-                }
             }
         }
     }
