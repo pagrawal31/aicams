@@ -53,7 +53,7 @@ class WebRTCClient(
     private var peerConnection: PeerConnection? = null
     private var started = false
     private var localDescriptionSet = false
-    private var connectionMode = StreamConnectionMode.RELAY_VIA_LAPTOP
+    private var connectionMode = StreamConnectionMode.P2P_VIA_SERVER_SIGNALING
     private var p2pSessionId: String? = null
     private var signalingTransport: SignalingTransport? = null
     private val localSessionId = java.util.UUID.randomUUID().toString()
@@ -78,7 +78,7 @@ class WebRTCClient(
     fun getRemoteRenderer(): SurfaceViewRenderer = remoteRenderer
 
     @Synchronized
-    fun start(connectionMode: StreamConnectionMode = StreamConnectionMode.RELAY_VIA_LAPTOP) {
+    fun start(connectionMode: StreamConnectionMode = StreamConnectionMode.P2P_VIA_SERVER_SIGNALING) {
         if (started || stopped.get()) {
             Log.d(TAG, "WebRTC start called but already started; ignoring duplicate call")
             return
@@ -95,10 +95,19 @@ class WebRTCClient(
         val onSignalingState: (String) -> Unit = signalingCallback@ { signalingState ->
             if (stopped.get()) return@signalingCallback
             Log.i(TAG, signalingState)
+            if (
+                signalingState == "signaling connected" &&
+                connectionMode == StreamConnectionMode.P2P_VIA_SERVER_SIGNALING &&
+                !mediaConnected.get()
+            ) {
+                p2pSessionId = null
+                offerSent.set(false)
+                peerConnection?.let(::sendOfferIfIceReady)
+            }
             val isFailure = signalingState.contains("error", ignoreCase = true) ||
                 signalingState.contains("failed", ignoreCase = true)
             if (isFailure) {
-                if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && mediaConnected.get()) {
+                if (connectionMode != StreamConnectionMode.RELAY_VIA_SERVER && mediaConnected.get()) {
                     // P2P signaling is only needed to establish WebRTC. A late socket/WebSocket
                     // failure must not replace a healthy direct media connection with an error.
                     Log.w(TAG, "Ignoring signaling failure after direct media connected: $signalingState")
@@ -116,8 +125,8 @@ class WebRTCClient(
                 onMessage = ::handleP2PSignalingMessage,
                 onState = onSignalingState
             )
-            StreamConnectionMode.RELAY_VIA_LAPTOP,
-            StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> P2PSignalingClient(
+            StreamConnectionMode.RELAY_VIA_SERVER,
+            StreamConnectionMode.P2P_VIA_SERVER_SIGNALING -> P2PSignalingClient(
                 baseUrl = cameraBaseUrl,
                 role = "viewer",
                 deviceId = java.util.UUID.randomUUID().toString(),
@@ -132,12 +141,9 @@ class WebRTCClient(
         CoroutineScope(Dispatchers.IO).launch {
             if (stopped.get()) return@launch
             try {
-                val iceServers = listOf(
-                    PeerConnection.IceServer("stun:stun.l.google.com:19302"),
-                    PeerConnection.IceServer("stun:stun1.l.google.com:19302")
-                )
+                val iceServers = IceServerProvider.create()
 
-                Log.d(TAG, "Using ICE servers: ${iceServers.map { it.uri }.joinToString()}")
+                Log.d(TAG, "Using ${iceServers.size} configured ICE server entries")
 
                 val config = PeerConnection.RTCConfiguration(iceServers).apply {
                     // Android can report ICE gathering COMPLETE before NetworkMonitor has
@@ -226,7 +232,7 @@ class WebRTCClient(
                     }
                     peerConnection = pc
                 }
-                if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP) {
+                if (connectionMode != StreamConnectionMode.RELAY_VIA_SERVER) {
                     val snapshotChannel = pc?.createDataChannel("motion-snapshots", DataChannel.Init())
                         ?: throw IllegalStateException("Could not create motion snapshot data channel")
                     snapshotsDataChannel = snapshotChannel
@@ -350,7 +356,7 @@ class WebRTCClient(
     }
 
     private fun sendOffer(offer: SessionDescription) {
-        if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP) {
+        if (connectionMode != StreamConnectionMode.RELAY_VIA_SERVER) {
             val payload = JSONObject()
                     .put("type", "offer")
                     .put("deviceId", Constants.P2P_DEVICE_ID)
@@ -506,13 +512,27 @@ class WebRTCClient(
                 }, answer)
             }
             "error" -> reportError(IllegalStateException(message.optString("message", "P2P signaling failed")))
-            "peer_disconnected" -> onConnectionStateChanged("DISCONNECTED")
+            "peer_disconnected" -> {
+                val disconnectedSessionId = message.optString("sessionId")
+                if (disconnectedSessionId != p2pSessionId) {
+                    Log.i(TAG, "Ignoring stale peer disconnect for session=$disconnectedSessionId")
+                    return
+                }
+                p2pSessionId = null
+                if (!mediaConnected.get()) {
+                    offerSent.set(false)
+                    peerConnection?.let(::sendOfferIfIceReady)
+                    onConnectionStateChanged("RECONNECTING")
+                } else {
+                    Log.i(TAG, "Signaling peer disconnected after media connected; keeping the active stream")
+                }
+            }
         }
     }
 
     private fun reportError(error: Throwable) {
         if (stopped.get()) return
-        if (connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && mediaConnected.get()) {
+        if (connectionMode != StreamConnectionMode.RELAY_VIA_SERVER && mediaConnected.get()) {
             Log.w(TAG, "Ignoring control-path error after direct media connected", error)
             return
         }
@@ -530,10 +550,13 @@ class WebRTCClient(
         Log.i(TAG, "$label transport (${lines.size} lines): ${lines.joinToString(" | ")}")
     }
 
-    @Synchronized
     fun stop() {
         if (!stopped.compareAndSet(false, true)) return
         Log.d(TAG, "Stopping WebRTC client")
+        Thread(::stopInternal, "AICAMsViewerStop").apply { isDaemon = true }.start()
+    }
+
+    private fun stopInternal() {
         mediaConnected.set(false)
         diagnostics.stop()
         try {
@@ -549,8 +572,9 @@ class WebRTCClient(
             remoteVideoTrack?.removeSink(remoteRenderer)
             remoteVideoTrack = null
             remoteAudioTrack = null
-            val connection = peerConnection
-            peerConnection = null
+            val connection = synchronized(this) {
+                peerConnection.also { peerConnection = null }
+            }
             connection?.close()
             connection?.dispose()
         } catch (_: Throwable) {

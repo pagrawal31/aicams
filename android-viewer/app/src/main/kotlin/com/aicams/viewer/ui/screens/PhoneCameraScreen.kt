@@ -67,7 +67,7 @@ fun PhoneCameraScreen(
     var isStreaming by remember { mutableStateOf(false) }
     var isFrontCamera by remember { mutableStateOf(false) }
     var audioAvailable by remember { mutableStateOf(false) }
-    var connectionMode by remember { mutableStateOf(StreamConnectionMode.RELAY_VIA_LAPTOP) }
+    var connectionMode by remember { mutableStateOf(StreamConnectionMode.P2P_VIA_SERVER_SIGNALING) }
     var motionDetectionActive by remember { mutableStateOf(false) }
     var motionDetected by remember { mutableStateOf(false) }
     val context = LocalContext.current
@@ -165,9 +165,9 @@ fun PhoneCameraScreen(
         ) {
             if (!isInPipMode) Text(
                 text = when (connectionMode) {
-                    StreamConnectionMode.RELAY_VIA_LAPTOP -> "Media relay: ${Constants.API_BASE_URL}"
-                    StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "Laptop signaling: ${Constants.API_BASE_URL}"
-                    StreamConnectionMode.P2P_LOCAL_WIFI -> "Local Wi-Fi signaling (no laptop)"
+                    StreamConnectionMode.RELAY_VIA_SERVER -> "Media relay: ${Constants.API_BASE_URL}"
+                    StreamConnectionMode.P2P_VIA_SERVER_SIGNALING -> "Signaling server: ${Constants.API_BASE_URL}"
+                    StreamConnectionMode.P2P_LOCAL_WIFI -> "Local Wi-Fi signaling (no server)"
                 },
                 style = MaterialTheme.typography.bodyMedium
             )
@@ -290,9 +290,9 @@ fun PhoneCameraScreen(
             if (!isInPipMode) errorMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             if (!isInPipMode) Text(
                 when (connectionMode) {
-                    StreamConnectionMode.RELAY_VIA_LAPTOP -> "Keep this screen open while streaming. Start the laptop relay first; media passes through the laptop."
-                    StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "Keep this screen open. Start the laptop service for signaling; media should flow directly between phones."
-                    StreamConnectionMode.P2P_LOCAL_WIFI -> "Keep this screen open and both phones on the same home Wi-Fi. This phone advertises itself; no laptop is needed."
+                    StreamConnectionMode.RELAY_VIA_SERVER -> "Keep this screen open while streaming. Media passes through the configured relay."
+                    StreamConnectionMode.P2P_VIA_SERVER_SIGNALING -> "Keep this screen open. The server handles signaling; media flows directly or through TURN when needed."
+                    StreamConnectionMode.P2P_LOCAL_WIFI -> "Keep this screen open and both phones on the same home Wi-Fi. This phone advertises itself; no server is needed."
                 },
                 style = MaterialTheme.typography.bodySmall
             )
@@ -312,7 +312,7 @@ fun PhoneCameraScreen(
                 enabled = !isStreaming,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(if (connectionMode == StreamConnectionMode.RELAY_VIA_LAPTOP) "Start Camera + Audio Stream" else "Start ${connectionMode.label()} Camera")
+                Text(if (connectionMode == StreamConnectionMode.RELAY_VIA_SERVER) "Start Camera + Audio Stream" else "Start ${connectionMode.label()} Camera")
             }
             if (!isInPipMode) Button(onClick = { navController.popBackStack() }, modifier = Modifier.fillMaxWidth()) {
                 Text("Stop and Return")
@@ -322,7 +322,7 @@ fun PhoneCameraScreen(
 }
 
 private fun StreamConnectionMode.label(): String = when (this) {
-    StreamConnectionMode.RELAY_VIA_LAPTOP -> "Laptop Relay"
-    StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "Laptop P2P"
+    StreamConnectionMode.RELAY_VIA_SERVER -> "Media Relay"
+    StreamConnectionMode.P2P_VIA_SERVER_SIGNALING -> "Internet P2P"
     StreamConnectionMode.P2P_LOCAL_WIFI -> "Local Wi-Fi"
 }

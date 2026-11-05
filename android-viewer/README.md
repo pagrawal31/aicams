@@ -112,6 +112,39 @@ cp local.properties.template local.properties
 # Or use Android Studio's Run button
 ```
 
+### STUN and TURN configuration
+
+`build-and-install.sh` loads the Git-ignored `.env.local` file automatically.
+The supported ICE settings are:
+
+```bash
+export AICAMS_STUN_URLS="stun:stun.l.google.com:19302"
+export AICAMS_TURN_URLS="turn:provider.example:3478?transport=udp,turns:provider.example:443?transport=tcp"
+export AICAMS_TURN_USERNAME="provider-username"
+export AICAMS_TURN_PASSWORD="provider-credential"
+```
+
+The normal build offers both STUN and TURN to WebRTC. ICE prefers a working
+direct route and uses TURN only when NAT or firewall traversal requires it:
+
+```bash
+./build-and-install.sh
+```
+
+To prove whether the same devices and networks work without TURN, build and
+install a STUN-only APK:
+
+```bash
+./build-and-install.sh --stun-only
+```
+
+While streaming, diagnostics log `via=direct` for a host/server-reflexive route
+or `via=TURN` for a relayed route. Inspect them with:
+
+```bash
+adb logcat -s AICAMsWebRTC AICAMsPhonePublisher | grep 'ice='
+```
+
 ## Architecture
 
 ### MVVM Pattern

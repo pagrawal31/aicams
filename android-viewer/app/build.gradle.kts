@@ -5,6 +5,14 @@ plugins {
     kotlin("kapt")
 }
 
+fun configuredValue(name: String, defaultValue: String): String =
+    providers.gradleProperty(name)
+        .orElse(providers.environmentVariable(name))
+        .getOrElse(defaultValue)
+
+fun buildConfigString(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
 android {
     namespace = "com.aicams.viewer"
     compileSdk = 34
@@ -15,6 +23,42 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+
+        buildConfigField(
+            "String",
+            "SIGNALING_BASE_URL",
+            buildConfigString(configuredValue("AICAMS_SIGNALING_BASE_URL", "http://192.168.29.102:8000"))
+        )
+        buildConfigField(
+            "String",
+            "CAMERA_DEVICE_ID",
+            buildConfigString(configuredValue("AICAMS_CAMERA_DEVICE_ID", "aicams-phone-camera"))
+        )
+        buildConfigField(
+            "String",
+            "SIGNALING_TOKEN",
+            buildConfigString(configuredValue("AICAMS_SIGNALING_TOKEN", ""))
+        )
+        buildConfigField(
+            "String",
+            "STUN_URLS",
+            buildConfigString(configuredValue("AICAMS_STUN_URLS", "stun:stun.l.google.com:19302"))
+        )
+        buildConfigField(
+            "String",
+            "TURN_URLS",
+            buildConfigString(configuredValue("AICAMS_TURN_URLS", ""))
+        )
+        buildConfigField(
+            "String",
+            "TURN_USERNAME",
+            buildConfigString(configuredValue("AICAMS_TURN_USERNAME", ""))
+        )
+        buildConfigField(
+            "String",
+            "TURN_PASSWORD",
+            buildConfigString(configuredValue("AICAMS_TURN_PASSWORD", ""))
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         

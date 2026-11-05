@@ -1,26 +1,35 @@
 package com.aicams.viewer.utils
 
+import com.aicams.viewer.BuildConfig
+
 object Constants {
     // API Configuration
 
     // below is for emulator
     // const val API_BASE_URL = "http://10.0.2.2:8000"
 
-    // below is for real device
-    const val API_BASE_URL = "http://192.168.29.102:8000"
-    const val P2P_DEVICE_ID = "aicams-phone-camera"
+    // Supplied at build time through AICAMS_* environment variables or Gradle properties.
+    val API_BASE_URL: String = BuildConfig.SIGNALING_BASE_URL.trimEnd('/')
+    val P2P_DEVICE_ID: String = BuildConfig.CAMERA_DEVICE_ID
+    val SIGNALING_TOKEN: String = BuildConfig.SIGNALING_TOKEN
     
     const val COORDINATOR_BASE_URL = "http://10.0.2.2:3000"
     const val SIGNALING_URL = "ws://10.0.2.2:8000"
     const val API_TIMEOUT_SECONDS = 30L
     
     // WebRTC Configuration
-    val STUN_SERVERS: List<String> = listOf(
-        "stun:stun.l.google.com:19302",
-        "stun:stun1.l.google.com:19302"
-    )
+    val STUN_SERVERS: List<String> = BuildConfig.STUN_URLS
+        .split(',')
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .map { url -> if (url.startsWith("stun:") || url.startsWith("stuns:")) url else "stun:$url" }
 
-    val TURN_SERVERS: List<String> = emptyList()
+    val TURN_SERVERS: List<String> = BuildConfig.TURN_URLS
+        .split(',')
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+    val TURN_USERNAME: String = BuildConfig.TURN_USERNAME
+    val TURN_PASSWORD: String = BuildConfig.TURN_PASSWORD
     
     // Video constraints
     const val VIDEO_WIDTH = 1920

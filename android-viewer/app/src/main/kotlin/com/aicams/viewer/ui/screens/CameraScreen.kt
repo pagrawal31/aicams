@@ -91,7 +91,7 @@ fun CameraScreen(
 ) {
     var connectionState by remember { mutableStateOf("connecting") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    var connectionMode by remember { mutableStateOf(StreamConnectionMode.RELAY_VIA_LAPTOP) }
+    var connectionMode by remember { mutableStateOf(StreamConnectionMode.P2P_VIA_SERVER_SIGNALING) }
     var motionDetected by remember { mutableStateOf<Boolean?>(null) }
     var receiverAudioEnabled by remember { mutableStateOf(true) }
     var isFullscreen by remember { mutableStateOf(false) }
@@ -258,9 +258,9 @@ fun CameraScreen(
                 }
                 Text(
                     text = when (connectionMode) {
-                        StreamConnectionMode.RELAY_VIA_LAPTOP -> "Laptop relay carries the media stream."
-                        StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "Laptop handles signaling only; media should flow directly between phones."
-                        StreamConnectionMode.P2P_LOCAL_WIFI -> "No laptop needed: discover the camera on the same Wi-Fi; media flows phone-to-phone."
+                        StreamConnectionMode.RELAY_VIA_SERVER -> "The configured media relay carries the stream."
+                        StreamConnectionMode.P2P_VIA_SERVER_SIGNALING -> "The server handles signaling; media flows directly or through TURN when needed."
+                        StreamConnectionMode.P2P_LOCAL_WIFI -> "No server needed: discover the camera on the same Wi-Fi; media flows phone-to-phone."
                     },
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -286,7 +286,7 @@ fun CameraScreen(
                 onEnterPip = { onEnterPip(pipOwner) }
             )
 
-            if (!isFullscreen && !isInPipMode && connectionMode != StreamConnectionMode.RELAY_VIA_LAPTOP && motionSnapshots.isNotEmpty()) {
+            if (!isFullscreen && !isInPipMode && connectionMode != StreamConnectionMode.RELAY_VIA_SERVER && motionSnapshots.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(
                         "Motion snapshots (${motionSnapshots.size})",
@@ -344,8 +344,8 @@ fun CameraScreen(
 }
 
 private fun StreamConnectionMode.label(): String = when (this) {
-    StreamConnectionMode.RELAY_VIA_LAPTOP -> "Laptop Relay"
-    StreamConnectionMode.P2P_VIA_LAPTOP_SIGNALING -> "Laptop P2P"
+    StreamConnectionMode.RELAY_VIA_SERVER -> "Media Relay"
+    StreamConnectionMode.P2P_VIA_SERVER_SIGNALING -> "Internet P2P"
     StreamConnectionMode.P2P_LOCAL_WIFI -> "Local Wi-Fi"
 }
 

@@ -1,8 +1,8 @@
 package com.aicams.viewer.webrtc
 
 enum class StreamConnectionMode {
-    RELAY_VIA_LAPTOP,
-    P2P_VIA_LAPTOP_SIGNALING,
+    RELAY_VIA_SERVER,
+    P2P_VIA_SERVER_SIGNALING,
     P2P_LOCAL_WIFI
 }
 
