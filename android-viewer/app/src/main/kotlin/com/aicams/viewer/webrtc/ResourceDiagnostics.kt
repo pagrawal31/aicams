@@ -78,10 +78,16 @@ internal class ResourceDiagnostics(
         var receivedBytes = 0L
         var hasSentCounter = false
         var hasReceivedCounter = false
+        var selectedCandidatePairId: String? = null
 
         report.statsMap.values.forEach { stat ->
             val members = stat.members
             when (stat.type) {
+                "transport" -> {
+                    (members["selectedCandidatePairId"] as? String)?.let {
+                        selectedCandidatePairId = it
+                    }
+                }
                 "outbound-rtp" -> {
                     (members["bytesSent"] as? Number)?.let {
                         sentBytes += it.toLong()
@@ -95,6 +101,28 @@ internal class ResourceDiagnostics(
                     }
                 }
             }
+        }
+
+        val selectedPair = selectedCandidatePairId
+            ?.let(report.statsMap::get)
+            ?: report.statsMap.values.firstOrNull { stat ->
+                stat.type == "candidate-pair" &&
+                    stat.members["state"] == "succeeded" &&
+                    stat.members["nominated"] == true
+            }
+        val localCandidate = (selectedPair?.members?.get("localCandidateId") as? String)
+            ?.let(report.statsMap::get)
+        val remoteCandidate = (selectedPair?.members?.get("remoteCandidateId") as? String)
+            ?.let(report.statsMap::get)
+        val localCandidateType = localCandidate?.members?.get("candidateType") as? String
+        val remoteCandidateType = remoteCandidate?.members?.get("candidateType") as? String
+        val candidateProtocol = localCandidate?.members?.get("protocol") as? String
+        val iceRoute = if (localCandidateType != null || remoteCandidateType != null) {
+            " ice=${localCandidateType ?: "unknown"}/${remoteCandidateType ?: "unknown"}" +
+                " protocol=${candidateProtocol ?: "unknown"}" +
+                if (localCandidateType == "relay" || remoteCandidateType == "relay") " via=TURN" else " via=direct"
+        } else {
+            ""
         }
 
         val nowMs = SystemClock.elapsedRealtime()
@@ -124,7 +152,8 @@ internal class ResourceDiagnostics(
             "webrtc role=$role tx=${if (hasSentCounter) "${sentBytes}B" else "n/a"}" +
                 "${txKbps?.let { " (${"%.1f".format(it)}kbps)" } ?: ""} " +
                 "rx=${if (hasReceivedCounter) "${receivedBytes}B" else "n/a"}" +
-                "${rxKbps?.let { " (${"%.1f".format(it)}kbps)" } ?: ""}"
+                "${rxKbps?.let { " (${"%.1f".format(it)}kbps)" } ?: ""}" +
+                iceRoute
         )
     }
 
